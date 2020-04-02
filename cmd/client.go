@@ -58,7 +58,8 @@ const maxBufferSize = 1024
 type UDPProxyConn struct {
 	conn         *net.UDPConn       // UDP Connection to the client
 	subscription *nats.Subscription // NATS subscription on the client topic
-	topic        string             // unique ID to identify this connection in the nats topic
+	id           string             // unique ID to identify this connection in the nats topic
+	topic        string
 }
 
 func (u *UDPProxyConn) Close() {
@@ -79,7 +80,6 @@ func NewConnection(addr *net.UDPAddr, nc *nats.Conn, alias string) (*UDPProxyCon
 	}
 	upc.conn = conn
 	id := randomString(10)
-	upc.topic = fmt.Sprintf("proxy/%s/frmcli/udp/%s", id, alias)
 
 	msgHandler := func(msg *nats.Msg) {
 		// log.Printf("write (to %v) %x\n", c.ClientConn.RemoteAddr(), msg.Data)
@@ -89,18 +89,24 @@ func NewConnection(addr *net.UDPAddr, nc *nats.Conn, alias string) (*UDPProxyCon
 		}
 	}
 
-	subTopic := fmt.Sprintf("proxy/%s/toCli/udp/%s", id, alias)
+	subTopic := fmt.Sprintf("proxy.%s.from.udp.%s", id, alias)
 	sub, err := nc.Subscribe(subTopic, msgHandler)
 	if err != nil {
 		log.Println(err)
 	}
 	upc.subscription = sub
+	upc.id = id
+	upc.topic = fmt.Sprintf("proxy.%s.to.udp.%s", id, alias)
 
 	return upc, nil
 }
 
 func (udpx *UDPProxyConn) Topic() string {
 	return udpx.topic
+}
+
+func (udpx *UDPProxyConn) ID() string {
+	return udpx.id
 }
 
 type ClientProxy struct {
@@ -142,8 +148,19 @@ func proxyClient(cmd *cobra.Command, args []string) {
 		log.Fatal(err)
 	}
 
+	var reconnectHandler = func(c *nats.Conn) {
+		log.Printf("Reconnected to nats-server %s\n", c.ConnectedAddr())
+	}
+
+	var disconnectedHandler = func(c *nats.Conn) {
+		log.Printf("Disconnected from nats-server %s\n", c.ConnectedAddr())
+	}
+
+	natsClient.SetDisconnectHandler(disconnectedHandler)
+	natsClient.SetReconnectHandler(reconnectHandler)
+
 	if natsClient.IsConnected() {
-		log.Printf("Connected to server %s:%v\n",
+		log.Printf("Connected to nats-server %s:%v\n",
 			viper.GetString("nats.broker-url"),
 			viper.GetString("nats.broker-port"))
 	}
@@ -180,7 +197,7 @@ type UDPListener struct {
 	conn    *net.UDPConn
 	conns   map[string]*UDPProxyConn
 	nc      *nats.Conn
-	errorCh chan<- struct{}
+	// errorCh chan<- struct{}
 	closeCh <-chan struct{}
 }
 
@@ -202,7 +219,7 @@ func NewUDPListener(address, alias string, nc *nats.Conn) (*UDPListener, error) 
 		conn:    conn,
 		conns:   make(map[string]*UDPProxyConn),
 		nc:      nc,
-		errorCh: make(chan struct{}),
+		// errorCh: make(chan struct{}),
 		closeCh: make(chan struct{}),
 	}
 
@@ -221,7 +238,7 @@ func (udpl *UDPListener) Close() {
 
 func (udpl *UDPListener) Run() {
 
-	log.Printf("proxying %v/UDP to '%s'/NATS)\n", udpl.address.String(), udpl.alias)
+	log.Printf("Listening on %v/UDP\n", udpl.address.String())
 	defer udpl.conn.Close()
 
 	buf := make([]byte, 1500)
@@ -250,15 +267,16 @@ func (udpl *UDPListener) Run() {
 			if err != nil {
 				log.Println(err)
 			}
-			log.Printf("Added incoming connection from %v/UDP\n", addr.String())
+			log.Printf("%v/UDP proxying traffic from %v/UDP to '%s'/NATS (ID: %s)\n",
+				udpl.address.String(),
+				addr.String(),
+				udpl.alias,
+				conn.ID())
 			udpl.Lock()
 			udpl.conns[addr.String()] = conn
 			udpl.Unlock()
 		}
 
-		// if alias != "ctl" {
-		// 	log.Printf("%s to NATS: %x", alias, buf[:n])
-		// }
 		if err := udpl.nc.Publish(conn.Topic(), buf[:n]); err != nil {
 			log.Println(err)
 		}
