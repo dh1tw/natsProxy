@@ -1,31 +1,14 @@
-/*
-Copyright © 2020 NAME HERE <EMAIL ADDRESS>
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
 package cmd
 
 import (
 	"fmt"
 	"log"
-	"math/rand"
-	"net"
 	"os"
 	"os/signal"
-	"sync"
-	"time"
+	"strings"
 
-	"github.com/nats-io/nats.go"
+	"github.com/dh1tw/natsProxy/udpproxy"
+	"github.com/dh1tw/natsProxy/utils"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
@@ -45,96 +28,31 @@ to quickly create a Cobra application.`,
 
 func init() {
 	rootCmd.AddCommand(clientCmd)
-	clientCmd.Flags().StringP("broker-url", "u", "localhost", "Broker URL")
-	clientCmd.Flags().IntP("broker-port", "p", 4222, "Broker Port")
-	clientCmd.Flags().StringP("password", "P", "", "NATS Password")
-	clientCmd.Flags().StringP("username", "U", "", "NATS Username")
-	clientCmd.Flags().StringToStringP("port-mapping", "m", map[string]string{"60001": "ctl", "60002": "cat", "60003": "sound"}, "UDP ports to proxy")
-	clientCmd.Flags().StringP("proxy-url", "y", "localhost", "interface on which the UDP proxy listens")
-}
-
-const maxBufferSize = 1024
-
-type UDPProxyConn struct {
-	conn         *net.UDPConn       // UDP Connection to the client
-	subscription *nats.Subscription // NATS subscription on the client topic
-	id           string             // unique ID to identify this connection in the nats topic
-	topic        string
-}
-
-func (u *UDPProxyConn) Close() {
-	if u.conn != nil {
-		_ = u.conn.Close()
-	}
-	if u.subscription != nil {
-		_ = u.subscription.Unsubscribe()
-	}
-	return
-}
-
-func NewConnection(addr *net.UDPAddr, nc *nats.Conn, alias string) (*UDPProxyConn, error) {
-	upc := new(UDPProxyConn)
-	conn, err := net.DialUDP("udp", nil, addr)
-	if err != nil {
-		return nil, err
-	}
-	upc.conn = conn
-	id := randomString(10)
-
-	msgHandler := func(msg *nats.Msg) {
-		// log.Printf("write (to %v) %x\n", c.ClientConn.RemoteAddr(), msg.Data)
-		_, err := upc.conn.Write(msg.Data)
-		if err != nil {
-			log.Println(err)
-		}
-	}
-
-	subTopic := fmt.Sprintf("proxy.%s.from.udp.%s", id, alias)
-	sub, err := nc.Subscribe(subTopic, msgHandler)
-	if err != nil {
-		log.Println(err)
-	}
-	upc.subscription = sub
-	upc.id = id
-	upc.topic = fmt.Sprintf("proxy.%s.to.udp.%s", id, alias)
-
-	return upc, nil
-}
-
-func (udpx *UDPProxyConn) Topic() string {
-	return udpx.topic
-}
-
-func (udpx *UDPProxyConn) ID() string {
-	return udpx.id
-}
-
-type ClientProxy struct {
-	sync.Mutex
-	nc           *nats.Conn
-	udpListeners map[string]*UDPListener
+	clientCmd.Flags().StringToStringP("port-mapping", "m",
+		map[string]string{
+			"0.0.0.0:60001":   "ctl",
+			":60002":          "cat",
+			"127.0.0.1:60003": "sound"}, "host:port to NATS alias mapping")
 }
 
 func proxyClient(cmd *cobra.Command, args []string) {
-	viper.BindPFlag("nats.broker-url", cmd.Flags().Lookup("broker-url"))
-	viper.BindPFlag("nats.broker-port", cmd.Flags().Lookup("broker-port"))
-	viper.BindPFlag("nats.password", cmd.Flags().Lookup("password"))
-	viper.BindPFlag("nats.username", cmd.Flags().Lookup("username"))
-	viper.BindPFlag("proxy.port-mapping", cmd.Flags().Lookup("port-mapping"))
-	viper.BindPFlag("proxy.url", cmd.Flags().Lookup("proxy-url"))
 
-	portMapping := viper.GetStringMapString("proxy.port-mapping")
-
-	// Workaround due to bug in viper see:
-	// https://github.com/spf13/viper/issues/608
-	// PR in the pipeline: https://github.com/spf13/viper/pull/874
-	if len(portMapping) == 0 {
-		var err error
-		portMapping, err = cmd.Flags().GetStringToString("port-mapping")
-		if err != nil {
-			log.Fatal(err)
+	// Try to read config file
+	if err := viper.ReadInConfig(); err == nil {
+		fmt.Println("Using config file:", viper.ConfigFileUsed())
+	} else {
+		if strings.Contains(err.Error(), "Not Found in") {
+			fmt.Println("no config file found")
+		} else {
+			fmt.Println("Error parsing config file", viper.ConfigFileUsed())
+			fmt.Println(err)
+			os.Exit(1)
 		}
 	}
+
+	viper.BindPFlag("proxy.port-mapping", cmd.Flags().Lookup("port-mapping"))
+
+	portMapping := viper.GetStringMapString("proxy.port-mapping")
 
 	natsURL := fmt.Sprintf("nats://%s:%s@%s:%d",
 		viper.GetString("nats.username"),
@@ -143,152 +61,22 @@ func proxyClient(cmd *cobra.Command, args []string) {
 		viper.GetInt("nats.broker-port"),
 	)
 
-	natsClient, err := nats.Connect(natsURL)
+	natsConn, err := utils.NatsConn(natsURL)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	var reconnectHandler = func(c *nats.Conn) {
-		log.Printf("Reconnected to nats-server %s\n", c.ConnectedAddr())
-	}
+	client := udpproxy.NewClient(natsConn)
 
-	var disconnectedHandler = func(c *nats.Conn) {
-		log.Printf("Disconnected from nats-server %s\n", c.ConnectedAddr())
-	}
-
-	natsClient.SetDisconnectHandler(disconnectedHandler)
-	natsClient.SetReconnectHandler(reconnectHandler)
-
-	if natsClient.IsConnected() {
-		log.Printf("Connected to nats-server %s:%v\n",
-			viper.GetString("nats.broker-url"),
-			viper.GetString("nats.broker-port"))
-	}
-
-	cp := ClientProxy{
-		nc:           natsClient,
-		udpListeners: make(map[string]*UDPListener),
-	}
-
-	// portMapping := viper.GetStringMapString("proxy.port-mapping")
-	addr := viper.GetString("proxy.url")
-	for port, alias := range portMapping {
-		laddr := addr + ":" + string(port)
-		udpl, err := NewUDPListener(laddr, alias, cp.nc)
+	for udpAddr, alias := range portMapping {
+		err := client.AddUDPListener(udpAddr, alias)
 		if err != nil {
-			log.Fatal(err)
+			log.Fatalf("%v", err)
 		}
-		go udpl.Run()
-		cp.udpListeners[laddr] = udpl
 	}
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
 	<-c
-	for _, udpl := range cp.udpListeners {
-		udpl.Close()
-	}
-}
-
-type UDPListener struct {
-	sync.Mutex
-	address *net.UDPAddr
-	alias   string
-	conn    *net.UDPConn
-	conns   map[string]*UDPProxyConn
-	nc      *nats.Conn
-	// errorCh chan<- struct{}
-	closeCh <-chan struct{}
-}
-
-func NewUDPListener(address, alias string, nc *nats.Conn) (*UDPListener, error) {
-
-	resolvedAddr, err := net.ResolveUDPAddr("udp", address)
-	if err != nil {
-		return nil, err
-	}
-
-	conn, err := net.ListenUDP("udp", resolvedAddr)
-	if err != nil {
-		return nil, err
-	}
-
-	udpl := &UDPListener{
-		address: resolvedAddr,
-		alias:   alias,
-		conn:    conn,
-		conns:   make(map[string]*UDPProxyConn),
-		nc:      nc,
-		// errorCh: make(chan struct{}),
-		closeCh: make(chan struct{}),
-	}
-
-	return udpl, nil
-}
-
-func (udpl *UDPListener) Close() {
-
-	udpl.Lock()
-	defer udpl.Unlock()
-	for name, conn := range udpl.conns {
-		delete(udpl.conns, name)
-		conn.Close()
-	}
-}
-
-func (udpl *UDPListener) Run() {
-
-	log.Printf("Listening on %v/UDP\n", udpl.address.String())
-	defer udpl.conn.Close()
-
-	buf := make([]byte, 1500)
-	for {
-		select {
-		case <-udpl.closeCh:
-			for _, c := range udpl.conns {
-				c.Close()
-			}
-			return
-		default:
-		}
-		udpl.conn.SetReadDeadline(time.Now().Add(time.Second))
-		n, addr, err := udpl.conn.ReadFromUDP(buf)
-		if err != nil {
-			if err, ok := err.(net.Error); ok && err.Timeout() {
-				continue
-			}
-			log.Println(err)
-		}
-		udpl.Lock()
-		conn, found := udpl.conns[addr.String()]
-		udpl.Unlock()
-		if !found {
-			conn, err = NewConnection(addr, udpl.nc, udpl.alias)
-			if err != nil {
-				log.Println(err)
-			}
-			log.Printf("%v/UDP proxying traffic from %v/UDP to '%s'/NATS (ID: %s)\n",
-				udpl.address.String(),
-				addr.String(),
-				udpl.alias,
-				conn.ID())
-			udpl.Lock()
-			udpl.conns[addr.String()] = conn
-			udpl.Unlock()
-		}
-
-		if err := udpl.nc.Publish(conn.Topic(), buf[:n]); err != nil {
-			log.Println(err)
-		}
-	}
-}
-
-func randomString(n int) string {
-	var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-
-	s := make([]rune, n)
-	for i := range s {
-		s[i] = letters[rand.Intn(len(letters))]
-	}
-	return string(s)
+	client.Close()
 }

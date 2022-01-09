@@ -1,0 +1,26 @@
+[nats]
+broker-url = "ea1tl.ddns.net"
+broker-port = 4222
+username = "dh1tw"
+password = "h3W1Q3hMl9kXy83WqX"
+
+
+# client
+[proxy.port-mapping]
+"0.0.0.0:40001" = "ctl"
+"0.0.0.0:40002" = "cat"
+"0.0.0.0:40003" = "sound"
+
+#client
+# [proxy.port-mapping]
+# ":40001" = "ctl"
+# "0.0.0.0:40002" = "cat"
+# ":40003" = "sound"
+# "192.168.178.255:9095" = "bcast"
+
+#server
+# [proxy.port-mapping]
+# "ctl" = ":40001" =
+# "cat" = "0.0.0.0:40002"
+# "sound" = "192.168.178.38:40003"
+# "bcast" = "192.168.178.255:9095"
